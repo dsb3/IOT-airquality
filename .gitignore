@@ -1,0 +1,7 @@
+
+# Hide our private-config.h file (example-config.h is a redacted copy)
+private-*
+
+# Ignore any compiled headers we might make by mistake
+*.gch
+
