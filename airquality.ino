@@ -30,23 +30,14 @@
   * Handle millis() rollover.  Perhaps NTP time instead?
   * Split .ino into multiple files for management - http://www.gammon.com.au/forum/?id=12625
   * OTA updates
-  * ...
-  * Because luminance can change far more rapidly than it's polled:
-    * report spot-luminance -- i.e. absolute last value
-    * report high-lum -- highest it's been in the past minute/15m/30m/...
-    * report low-lum  -- lowest it's been in the same period
-  *
 
-     // todo -- if lux changes more than 50%, then send a mqtt update immediately, else wait for the timer
 
 
 **********************************************************/
 
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 
-// Comment this line out for the Feather Huzzah ESP8266
-#define ESP32
 
 
 // Private config held in separate file
@@ -55,20 +46,29 @@
 #include "private-config.h"
 
 
-#ifdef ESP32
-#include <WiFi.h>
-#else
+// determine board, for the specific boards I'm developing against
+
+// code will fail to compile if neither of these is true, as no Wifi include is made
+
+#ifdef ARDUINO_ESP8266_ADAFRUIT_HUZZAH
+
+#define boardident "esp8266"
+#define BOARDNAME "Adafruit Huzzah ESP8266"
 #include <ESP8266WiFi.h>
+
+#endif
+
+#ifdef ARDUINO_FEATHER_ESP32
+
+#define boardident "esp32"
+#define BOARDNAME "Adafruit Feather ESP32"
+#include <WiFi.h>
+
 #endif
 
 
 // save macaddr during setup()
 char macaddr[15] = "";
-
-
-
-// TODO - capture and push the autodiscovery json payload
-
 
 
 
@@ -85,7 +85,8 @@ char macaddr[15] = "";
 char mqttIdent[64] = "";
 
 
-int mqttBufferSize = MQTT_MAX_PACKET_SIZE;   // default, from headers
+// default value from headers; we need to increase this from default 256 bytes for oversize JSON data
+int mqttBufferSize = MQTT_MAX_PACKET_SIZE;
 
 
 
@@ -98,8 +99,8 @@ int mqttBufferSize = MQTT_MAX_PACKET_SIZE;   // default, from headers
 #include <SensirionI2CSen5x.h>
 #include <Wire.h>
 
-// SEN5x docs talk about I2C_BUFFER_LENGTH being bigger than some Arduino implementation; not a concern for our ESP32 or ESP8266
-
+// SEN5x docs talk about I2C_BUFFER_LENGTH being bigger than some Arduino implementation; not a concern for
+// the boards I'm using so I've stripped from the code sample I used
 SensirionI2CSen5x sen5x;
 
 
@@ -118,7 +119,6 @@ float ambientTemperature;
 float vocIndex;
 float noxIndex;
 
-float lastLux = 0;
 float lastPM1 = 0;
 float lastPM25 = 0;
 float lastPM4 = 0;
@@ -139,18 +139,10 @@ boolean pm10Changed = 0;
 
 
 //
+float lastLux = 0;
 boolean luxChanged = 0;
 
     
-
-// not used any more -- todo, why are they marked volatile?
-volatile float temp = 0.0;
-volatile boolean tempGood = 0;    // value is not good before first reading
-volatile float humidity = 0.0;
-volatile boolean humidityGood = 0;
-
-
-
 
 
 
@@ -185,6 +177,8 @@ unsigned long lastEnviron = 30000;
 unsigned long lastLuminance = 30000;
 
 
+// timestamp of when we can next connect -- on mqtt failure we push it into the future
+unsigned long nextMqttConnect = 0;
 
 
 // callback function is needed for the MQTT client connection string, but only used when subscribing to
@@ -243,38 +237,7 @@ String processor(const String& var){
 				(int) (m / 1000 % 60));
 		}
 	}
- 
-	// TODO: since these are String(), can they be in a case statement for easier reading?
-	else if (var == "LUMINANCE" && luxGood) {
-		sprintf(buffer, "%0.2f", lux);
-	}
- 
-	else if (var == "TEMPERATURE" && tempGood) {
-		sprintf(buffer, "%0.2f", temp);
-	}
- 
-	else if (var == "HUMIDITY" && humidityGood) {
-		sprintf(buffer, "%0.2f", humidity);
-	}
 
-	else if (var == "MACADDR") {
-		sprintf(buffer, macaddr);
-	}
-	
-	// future use for a config.json type entry.
-	// also want to capture build time (USEMQTT etc) vars
-	else if (var == "VERSION") {
-		sprintf(buffer, VERSION);
-	}
-	else if (var == "BUILDDATE") {
-		sprintf(buffer, __DATE__);
-	}
-	else if (var == "BUILDTIME") {
-		sprintf(buffer, __TIME__);
-	}
-	else if (var == "BUILDFILE") {
-		sprintf(buffer, __FILE__);
-	}
  
 	// Catch all for any unrecognized variable name
 	else {
@@ -290,7 +253,7 @@ String processor(const String& var){
 
 
 
-// mqtt publish update
+// mqtt publish updates
 //
 // We always send "retain: true" with messages; the last seen state
 // will be an appropriate value to use if a system restarts
@@ -298,50 +261,40 @@ String processor(const String& var){
 
 
 boolean mqttConnect() {
-  // are we already connected?
-  //
-  // note - this attempts to connect each time we send state; if we get more nuanced here
-  // we may want a lastReconnectAttempt = millis() structure to not try to reconnect too often
+  // if we are not already connected ...
   if (! mqttclient.connected() ) {
-    Serial.print("Connecting to MQTT broker ... ");
 
-
-  ///// TODO: don't mark values as unavailable just if the bridge goes unavailable
-   ///// mark based on the AGE of the value.  we can have a timestamp on the data to age it out.
-
-   
-    // if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass) ) {
+    // ... and we didn't try to connect (and fail) too recently ...
+    if (millis() > nextMqttConnect) {
+    
+      // ... then try to connect
+      Serial.print("Connecting to MQTT broker ... ");
   
-    if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass, "aq2mqtt/246F28035110/availability", 0, true, "offline") ) {  // todo: hardcoded
-      Serial.println("failed.");
-      return false;
-    }
-    else {
-      mqttclient.publish("aq2mqtt/246F28035110/availability", "online", true); // no error checking on this one.
-      Serial.println("ok.");
-
-
-  // try to increase size of MQTT buffer.  
-
-  // TODO: capture return code on failure and send shorter messages.
-  // -- we would not be able to send autoconfig messages; also not able to send full JSON state messages with all data
-      if ( mqttclient.setBufferSize(512) ) {
-        mqttBufferSize = 512;
+      if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass, "aq2mqtt/246F28035110/availability", 0, true, "offline") ) {  // todo: hardcoded - update to serial of sen5x
+        Serial.println("failed.");
+        nextMqttConnect = millis() + 60000;   // next allowed in 60 seconds
+        return false;
       }
       else {
-        Serial.println("  Failed to set MQTT buffer size; we are unable to send JSON autoconfig entries.");
+        mqttclient.publish("aq2mqtt/246F28035110/availability", "online", true); // no error checking on this one.
+        Serial.println("ok.");
+
+        // try to set; and then read it back; if it wasn't able to be set we report when we try to use it
+        mqttclient.setBufferSize(512);
+        mqttBufferSize = mqttclient.getBufferSize();
+      
+        char msg[32];
+        sprintf(msg, "%d", mqttBufferSize);
+        mqttclient.publish("aq2mqtt/246F28035110/buffersize", msg, false);
+    
       }
-      
-      char msg[32];
-      sprintf(msg, "%d", mqttBufferSize);
-      mqttclient.publish("aq2mqtt/246F28035110/buffersize", msg, false);
-      
     
     }
-    
+
+
   }
 
-    
+  nextMqttConnect = 0;  // success; we can reconnect if needed at any time
   return true;
 
   
@@ -349,12 +302,72 @@ boolean mqttConnect() {
 }
 
 
-// General function to send autoconfig strings
-void mqttSendAutoconfig() {
+// General function to send hardware configuration
+//
+// TODO - some of these values may change; if that happens, detect and resend
+// -- sensors may go unavailable, so disable in info
+//    wifi might reconnect with a different IP
+
+boolean mqttSendHardwareInfo() {
 
   // connect / reconnect if needed
   if (! mqttConnect()) {
-    return;
+    return 0;
+  }
+ 
+  char topic[64];
+  char msg[512];
+
+  if (mqttBufferSize < 512) {
+    Serial.println("MQTT Buffer not big enough for hardware information string.  Not sent.");
+    return 0;
+  }
+
+// - literal json string
+  const char* json = R"({
+    "board": { "model": "%s" },
+    "connection": { "ipaddr": "%d.%d.%d.%d", "macaddr": "%s" },
+    "software": { "version": "%s", "compiledate": "%s", "compiletime": "%s" },
+    "sensors": {
+       "lux": { "model": "veml7700" },
+       "env": { "model": "sen55", serial: "%s", firmware: "%s" }
+    }
+})";
+// end string
+
+    sprintf(msg, json, 
+      BOARDNAME,
+      WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3],
+      macaddr,
+      __VERSION__, __DATE__, __TIME__,
+      "senserial",
+      "firm1.x"
+    );
+
+    sprintf(topic, "aq2mqtt/%s/hardware", macaddr);   // TODO: data should be tagged with serial number of the SEN5x, not the mac of the board.
+
+    Serial.print("Sending MQTT hardware configuration info ... ");    
+
+    if (! mqttclient.publish(topic, msg, true)) {
+      Serial.println("failed to send.");
+      return 0;
+    }
+    else {
+      Serial.println("ok.");
+    }
+
+  return 1;
+  
+}
+
+
+
+// General function to send autoconfig strings
+boolean mqttSendAutoconfig() {
+
+  // connect / reconnect if needed
+  if (! mqttConnect()) {
+    return 0;
   }
 
  
@@ -365,10 +378,13 @@ void mqttSendAutoconfig() {
 
   if (mqttBufferSize < 512) {
     Serial.println("  MQTT Buffer not big enough for JSON autoconfig strings.  Not sent.");
-    return;
+    return 0;
   }
 
   Serial.println("  Not yet supported.  Please autoconfig manually.");   // TODO, of course
+
+
+  return 1;
   
 }
 
@@ -384,30 +400,39 @@ boolean mqttSendState() {
   char topic[64];  // topic
   char msg[512];   // message
 
+  if ( millis() <  30000 ) {  // meterSendFreq ) {  //todo rename settleTime
+    
+    Serial.println("Waiting for sensors to settle...");
+    return 0;
+  }
+
+
   // connect / reconnect if needed
   if (! mqttConnect()) {
-    return false;
+    return 0;
   }
   
 
   
 // - literal json string
   const char* json = R"({
-  "lux": "%0.2f",
-  "temp": "%0.2f",
-  "humidity": "%0.2f",
-  "particulate": { "pm1": "%0.2f", "pm25": "%0.2f", "pm4": "%0.2f", "pm10": "%0.2f" },
-  "vocIndex": "%d",
-  "noxIndex": "%d",
-  "hardware": {
-    "ipaddr": "%d.%d.%d.%d",
-    "macaddr": "%s"
-  }
+   "env": { "lux": "%0.2f", "temp": "%0.2f", "humidity": "%0.2f" },
+   "particulate": { "pm1": "%0.2f", "pm25": "%0.2f", "pm4": "%0.2f", "pm10": "%0.2f" },
+   "index": { "voc": "%d", "nox": "%d" } 
 })";
 // end string
 
 
- // TODO: if isnan() then do not insert a number at all - blank, or literal "false" for invalid reading
+ // TODO: if isnan() then do not insert a number at all - blank, or literal "false" for unavailable reading
+ 
+ // TODO: different sensors take different times to "settle" after startup
+ //       we should omit (so they go unavailable) those rather than send bad values
+ //
+ // lux             = 5 seconds, but can delay to 30 to fit with the other "env" set
+ // temp / humidity = 30 seconds
+ // voc / nox       = 60 seconds
+ // pmX             = unknown ... seems fairly quick.  perhaps 30 is enough?
+ //
  
     sprintf(msg, json, 
       luxGood ? lux : -1,
@@ -420,30 +445,21 @@ boolean mqttSendState() {
       isnan(massConcentrationPm10p0) ? -1 : massConcentrationPm10p0,
       
       isnan(vocIndex) ? -1 : (int)vocIndex,
-      isnan(noxIndex) ? -1 : (int)noxIndex,
-      WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3],
-      macaddr
+      isnan(noxIndex) ? -1 : (int)noxIndex
+
     );
 
 
-    sprintf(topic, "aq2mqtt/%s/state", macaddr);
+    sprintf(topic, "aq2mqtt/%s/state", macaddr);   // TODO: data should be tagged with serial number of the SEN5x, not the mac of the board.
 
-    //const char* shortj = R"({ "lux": "%0.2f", "temp": "%0.2f" })";
-    //sprintf(msg, shortj, lux, ambientTemperature);
     
 		Serial.print("Sending MQTT state ... ");
-
-            
-    if ( ! millis() > lastEnviron ) {
-      Serial.println("  Waiting for sensors to settle... skipped.");
+	  if (! mqttclient.publish(topic, msg, true)) {
+      Serial.println("failed to send.");
       return 0;
     }
-
-
-	  if (mqttclient.publish(topic, msg, true)) {
-		  
+    else {
 			Serial.println(" sent.");
-
 
       // save the "last SENT values"
       lastLux = lux;
@@ -456,23 +472,17 @@ boolean mqttSendState() {
       lastVoc = vocIndex;
       lastNox = noxIndex;
 
+      // changes are based on the last values that were actually sent; not the last that were measured
       temperatureChanged = 0; humidityChanged = 0;
       vocChanged = 0; noxChanged = 0;
       pm1Changed = 0; pm25Changed = 0; pm4Changed = 0; pm10Changed = 0;
       luxChanged = 0;
 
       sendStateNow = 0;
-      
-		}
-		else {
-		  Serial.println("failed to send.");
-      return 0;
-		}
-			
 
-    return 1;
+		}
 	
-	
+  return 1;
 
 }
 
@@ -562,75 +572,10 @@ void pollsen() {
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
     }
-    else {
 
-    // Did our environment state change significantly compared to the last time we sent state to MQTT?
-    // Amount of change depends on the measurement.
-    // Save specifically which value changed so we can mark it in our diagnostic output
-
-    // TODO: some of these look like they don't work correctly
-
-    // TODO: if we disconnect from mqtt server, we COULD force a resend to reconnect rather 
-    if (abs(lastTemperature - ambientTemperature) >= 0.4) {
-      sendStateNow = 1;
-      temperatureChanged = 1;
-    }
-
-    if (abs(lastHumidity - ambientHumidity) >= 5) {
-      sendStateNow = 1;
-      humidityChanged = 1;
-    }
-
-    if (abs(lastVoc - vocIndex) > 5) {
-      sendStateNow = 1;
-      vocChanged = 1;
-    }
-
-    if (abs(lastNox - noxIndex) > 5) {
-      sendStateNow = 1;
-      noxChanged = 1;
-    }
-
-    if ( (lastPM1  != 0 && massConcentrationPm1p0  != 0) && ( ( (lastPM1  / massConcentrationPm1p0) > 1.5) || (lastPM1  / massConcentrationPm1p0) < 0.6) ) {
-      sendStateNow = 1;
-      pm1Changed = 1;
-    }
     
-    if ( (lastPM25 != 0 && massConcentrationPm2p5  != 0) && ( ( (lastPM25 / massConcentrationPm2p5) > 1.5) || (lastPM25 / massConcentrationPm2p5) < 0.6) ) {
-      sendStateNow = 1;
-      pm25Changed = 1;
-    }
-
-    if ( (lastPM4  != 0 && massConcentrationPm4p0  != 0) && ( ( (lastPM4  / massConcentrationPm4p0) > 1.5) || (lastPM4  / massConcentrationPm4p0) < 0.6) ) {
-      sendStateNow = 1;
-      pm4Changed = 1;
-    }
-
-    if ( (lastPM10 != 0 && massConcentrationPm10p0 != 0) && ( ( (lastPM10 / massConcentrationPm1p0) > 1.5) || (lastPM10  / massConcentrationPm10p0) < 0.6) ) {
-      sendStateNow = 1;
-      pm10Changed = 1;
-    }
     
-
-
-
-      // Print measurements once they have stabilized (== once they are marked to send via MQTT)
-      // TODO: move this to loop() and print Lux as well for diags
-      if ( millis() > lastEnviron ) {
-        Serial.print("  Temp: ");    Serial.print(temperatureChanged ? "*" : ""); Serial.print(ambientTemperature);
-        Serial.print("\t Humd: ");   Serial.print(humidityChanged ? "*" : "");    Serial.print(ambientHumidity);
-
-        Serial.print("\t Voc: ");    Serial.print(vocChanged ? "*" : "");         Serial.print(vocIndex);
-        Serial.print("\t Nox: ");    Serial.print(noxChanged ? "*" : "");         Serial.print(noxIndex);
-        
-        Serial.print("\t PM1: ");    Serial.print(pm1Changed ? "*" : "");         Serial.print(massConcentrationPm1p0);
-        Serial.print("\t PM2.5: ");  Serial.print(pm25Changed ? "*" : "");        Serial.print(massConcentrationPm2p5);
-        Serial.print("\t PM4: ");    Serial.print(pm4Changed ? "*" : "");         Serial.print(massConcentrationPm4p0);
-        Serial.print("\t PM10: ");   Serial.print(pm10Changed ? "*" : "");        Serial.print(massConcentrationPm10p0);
-
-        Serial.println("");
-      }  
-    }
+    
 
 
     
@@ -646,6 +591,11 @@ void setup() {
   Serial.println("");
   Serial.println("");
 	Serial.println("Air Quality monitoring system starting.");
+  Serial.print("Compiled for "); Serial.println(BOARDNAME);
+  Serial.println(__FILE__);
+  Serial.print("Version "); Serial.print(VERSION);
+    Serial.print(" - "); Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
+  
   Serial.println("");
 
 
@@ -655,9 +605,9 @@ void setup() {
   // Look for VEML7700 lux sensor
 
   // Setup VEML7700 lux sensor
-  // TODO: in testing, if I unplug the lux sensor it starts
-  // giving unreasonably high readings.  If we see this, we can
-  // just disable it - flag as "unavailable".
+  // TODO: in testing, if I unplug the lux sensor after the board boots, 
+  // it starts giving unreasonably high readings.  If we see this, we can
+  // just disable it and flag as "unavailable".
   if (!veml.begin()) {
     Serial.println("Lux sensor not found");
     luxPresent = 0;
@@ -689,7 +639,7 @@ void setup() {
     //veml.powerSaveEnable(true);
     //veml.setPowerSaveMode(VEML7700_POWERSAVE_MODE4);
     
-    // Disabling these - we just poll; don't need interrupts on thresholds
+    // Disabling these - we poll frequently enough to not need interrupts
     //veml.setLowThreshold(10000);
     //veml.setHighThreshold(20000);
     //veml.interruptEnable(true);
@@ -710,11 +660,11 @@ void setup() {
     char errorMessage[256];
     error = sen5x.deviceReset();
     if (error) {
-        Serial.println("Environment sensor not found");
-        Serial.print("  Error trying to execute deviceReset(): ");
-        errorToString(error, errorMessage, 256);
-        Serial.println(errorMessage);
-        aqPresent = 0;
+      Serial.println("Environment sensor not found");
+      Serial.print("  Error trying to execute deviceReset(): ");
+      errorToString(error, errorMessage, 256);
+      Serial.println(errorMessage);
+      aqPresent = 0;
     }
     else {
       aqPresent = 1;
@@ -726,19 +676,17 @@ void setup() {
     printModuleVersions();
     printSerialNumber();
 
-  }
-
-
     // Start Measurement
     error = sen5x.startMeasurement();
     if (error) {
-        Serial.print("Error trying to execute startMeasurement(): ");
-        errorToString(error, errorMessage, 256);
-        Serial.println(errorMessage);
-
-        // disable
-        aqPresent = 0;
+      Serial.print("Error trying to execute startMeasurement(): ");
+      errorToString(error, errorMessage, 256);
+      Serial.println(errorMessage);
+      // disable
+      aqPresent = 0;
     }
+    
+  }
 
   
   Serial.println("");
@@ -748,11 +696,9 @@ void setup() {
 	
 
 
+	Serial.print("Searching for wifi SSID ");
+  Serial.print(wifiName);
   
-  
-
-
-	Serial.println("Connecting to wifi ....");
 	WiFi.mode(WIFI_STA);
 	WiFi.begin(wifiName, wifiPass);
 	Serial.println("");
@@ -763,9 +709,7 @@ void setup() {
 		Serial.print(".");
 	}
 	Serial.println("");
-	Serial.print("Connected to ");
-	Serial.println(wifiName);
-	Serial.print("IP address: ");
+	Serial.print("Connected - ");
 	Serial.println(WiFi.localIP());
 
 	// Read and save mac address one time since it won't change
@@ -777,32 +721,18 @@ void setup() {
 			macaddr[j++] = c;
 	macaddr[j] = '\0';
 	
-	
-	Serial.print("MAC address: ");
-	Serial.println(macaddr);
 
-#ifdef ESP32
-	sprintf(mqttIdent, "esp32-%s", macaddr);
-#else
-  sprintf(mqttIdent, "esp8266-%s", macaddr);
-#endif
-
-	Serial.print("MQTT Client Ident: ");
-	Serial.println(mqttIdent);
-	Serial.println("");
-
-	// Connect to MQTT for initial updates 
-	Serial.println("Connecting to MQTT server for initial updates: ");
-
+  // MQTT identifier is esp32-(mac), or esp8266-(mac) for later use
+	sprintf(mqttIdent, "%s-%s", boardident, macaddr);
 
 
   // we don't have measurements yet, but have confirmed whether hardware is present and
   // can send our autoconfig JSON
   mqttSendAutoconfig();
-  
 
-  // todo -- print value 
-  Serial.println("Waiting for sensors to settle ...");
+  // Send board / hardware info
+  mqttSendHardwareInfo();
+  
 
 }
 
@@ -817,119 +747,135 @@ void setup() {
 void loop()
 {
 
-	
-  
-  
-    // how often to take Temp and Humidity measurements ... this is every 5 seconds.
-    
-  
 
-  
-/*
-	// refresh sensors, avoiding refreshing "too often"
-	if (millis() - lastTempHumidity > delayTempHumidity && dhtPresent) {
-		lastTempHumidity = millis();
-		
-		sensors_event_t event;
-		dht.temperature().getEvent(&event);
-		if (isnan(event.temperature)) {
-			// TODO: on too many failures, disable future reads (dhtPresent = 0)
-			// Serial.println("Reading temp failed; disabling");
-			tempGood = 0;
-		}
-		else {
-			float lastT = temp;
-			temp = (event.temperature * 1.8) + 32;
-			tempGood = 1;
-			
-			// more than 1 degree change?
-			if (abs(temp - lastT) > 1.0) {
-				sendStateNow = 1;
-			}
-		}
-		
-		// repeat for humidity
-		dht.humidity().getEvent(&event);
-		if (isnan(event.relative_humidity)) {
-			// Serial.println("Reading humidity failed; disabling");
-			humidityGood = 0;
-		}
-		else {
-			float lastH = humidity;
-			
-			humidity = event.relative_humidity;
-			humidityGood = 1;
-			
-			// more than 5 percent change?
-			if (abs(humidity - lastH) > 5.0) {
-				sendStateNow = 1;
-			}
+  bool readLux = 0;
+  bool readEnv = 0;
 
-		}
-	}
+  // todo - we can read lux more often.  perhaps every 2.5 seconds versus 5.0 for envs.
+    if (millis() - lastEnviron > delayEnviron && luxPresent) {
 
-*/
+    // poll lux sensor
+    lux = veml.readLux();
+
+    if (lux > 500000000) {  // from observation errors == 989560448.00
+      Serial.println("Lux sensor out of range - disabling");
+      luxPresent = 0;
+      luxGood = 0;
+    } else {
+      
+      luxGood = 1;
+    }
+
+    readLux = 1;
+  }
+
 
   if (millis() - lastEnviron > delayEnviron && aqPresent) {
-
+    // poll environmental sensor
     pollsen();
-    lastEnviron = millis();
+
+    readEnv = 1;
+  }
 
 
+
+
+  // did we take a reading from either sensor ...
+  if (readLux || readEnv) {
+    
+    // ... and if so, did any values change "significantly" from the last time they were sent via MQTT?
+    // Amount of change depends on the measurement - absolute, or percentage.
+    //
+    // We also save which value changed to flag it in the diagnostic output.
+    //
+    
+    if (abs(lastTemperature - ambientTemperature) >= 0.4) {
+      sendStateNow = 1;
+      temperatureChanged = 1;
+    }
+
+    if (abs(lastHumidity - ambientHumidity) >= 4) {
+      sendStateNow = 1;
+      humidityChanged = 1;
+    }
+
+    if (abs(lastVoc - vocIndex) > 5) {
+      sendStateNow = 1;
+      vocChanged = 1;
+    }
+
+    if (abs(lastNox - noxIndex) > 5) {
+      sendStateNow = 1;
+      noxChanged = 1;
+    }
+
+    // be careful of divide by zero on comparisons
+    if ( (lastPM1  > 0 && massConcentrationPm1p0  > 0) && ( ( (lastPM1  / massConcentrationPm1p0) > 1.5)  || (lastPM1  / massConcentrationPm1p0) < 0.6) ) {
+      sendStateNow = 1;
+      pm1Changed = 1;
+    }
+    
+    if ( (lastPM25 > 0 && massConcentrationPm2p5  > 0) && ( ( (lastPM25 / massConcentrationPm2p5) > 1.5)  || (lastPM25 / massConcentrationPm2p5) < 0.6) ) {
+      sendStateNow = 1;
+      pm25Changed = 1;
+    }
+
+    if ( (lastPM4  > 0 && massConcentrationPm4p0  > 0) && ( ( (lastPM4  / massConcentrationPm4p0) > 1.5)  || (lastPM4  / massConcentrationPm4p0) < 0.6) ) {
+      sendStateNow = 1;
+      pm4Changed = 1;
+    }
+
+    if ( (lastPM10 > 0 && massConcentrationPm10p0 > 0) && ( ( (lastPM10 / massConcentrationPm10p0) > 1.5) || (lastPM10  / massConcentrationPm10p0) < 0.6) ) {
+      sendStateNow = 1;
+      pm10Changed = 1;
+    }
     
 
- // TODO -- mark pmGood when they stabilise
-   
-// TODO -- mark "tempGood" when temp stabilizes ... appears to generate temp=0 on first run
+    if ( (lastLux > 0 && lux > 0) && ( ( (lastLux / lux) > 1.5) || (lastLux  / lux) < 0.6) ) {
+      sendStateNow = 1;
+      luxChanged = 1;
+    }
 
 
+
+    // Print measurements once they have stabilized (== once they are marked to send via MQTT)
+    // TODO: move this to loop()
+    // TODO: rename lastEnviron to "settle time" or similar
+    if ( millis() > lastEnviron ) {
+      Serial.print("  T: ");       Serial.print(temperatureChanged ? "*" : ""); Serial.print(ambientTemperature);
+      Serial.print("\t RH: ");     Serial.print(humidityChanged ? "*" : "");    Serial.print(ambientHumidity);
+      
+      Serial.print("\t Voc: ");    Serial.print(vocChanged ? "*" : "");         Serial.print(vocIndex);
+      Serial.print("\t Nox: ");    Serial.print(noxChanged ? "*" : "");         Serial.print(noxIndex);
+      
+      Serial.print("\t PM1: ");    Serial.print(pm1Changed ? "*" : "");         Serial.print(massConcentrationPm1p0);
+      Serial.print("\t PM2.5: ");  Serial.print(pm25Changed ? "*" : "");        Serial.print(massConcentrationPm2p5);
+      Serial.print("\t PM4: ");    Serial.print(pm4Changed ? "*" : "");         Serial.print(massConcentrationPm4p0);
+      Serial.print("\t PM10: ");   Serial.print(pm10Changed ? "*" : "");        Serial.print(massConcentrationPm10p0);
+      
+      Serial.print("\t Lux: ");    Serial.print(luxChanged ? "*" : "");         Serial.print(lux);
+      Serial.println("");
+    }  
+
+    lastEnviron = millis();
 
 
   }
 
-    
-	// Note: trying to readLux() with the board absent will cause
-	// the entire platform to crash.  So only poll if it's there
-	if (millis() - lastLuminance > delayLuminance && luxPresent) {
-		float lastL = lux;
-		
-		lastLuminance = millis();
-		lux = veml.readLux();
-		
-		if (lux == 989560448.00) {   // from observation .... todo replace with a > for "randomly large number"
-			Serial.println("Lux sensor out of range - disabling");
-			luxPresent = 0;
-			luxGood = 0;
-		} else {
-			// more than 5 point change?
-			if (abs(lux - lastL) > 5.0) {
-				sendStateNow = 1;
-			}
-			
-			luxGood = 1;
-		}
 
-	}
+  
 	
 	
 	
-	
-	// if we are not connected, try to send now
+	// if we became disconnected, flag to resend
 	if (! mqttclient.connected() ) {
     Serial.println("MQTT became disconnected.");
     sendStateNow = 1;
 	}
  
     
-	
-	// TODO: deprecate serial output.
-
-	
+			
 	// Update stats when prompted, or every N milliseconds
-	//
-	// TODO: separate flags to update stats for different measurements
-	// -- just because door opened doesn't mean we should push a temp update
-	// -- ^ this is done; now need to split out temp/humid/lux to separate updates
 	//
 	if ( ( sendStateNow && millis() - lastEnvTime > envFreq && millis() > lastEnviron ) ||
 	     ( millis() - lastEnvTime > envForceFreq) ) {
@@ -938,9 +884,9 @@ void loop()
 		
 		if (mqttSendState()) {
 		  lastEnvTime = millis();
-     
 		}
-		
+
+    
 	}
 	
 
