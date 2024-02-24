@@ -1,0 +1,24 @@
+{
+  "device": {
+    "identifiers": [ "aq2mqtt_246F28035110" ],
+    "manufacturer": "Spoonglur",
+    "model": "Beastie",
+    "name": "Air Quality Sensor",
+    "sw_version": "0.1.0"
+  },
+
+  "force_update": true,
+  "expire_after": 600,
+
+  "json_attributes_topic": "aq2mqtt/246F28035110/state",
+  "state_topic": "aq2mqtt/246F28035110/state",
+
+  "name": "Env Humidity",
+  "unit_of_measurement": "%",
+  "device_class": "humidity",
+  "suggested_display_precision": 0,
+
+  "unique_id": "aq2mqtt__246F28035110__humidity",
+  "value_template": "{{ value_json.env.humidity }}"
+}
+
