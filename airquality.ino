@@ -27,16 +27,16 @@
 
   
   TODO:
-  * Handle millis() rollover.  Perhaps NTP time instead?
+  * Handle millis() rollover.  Perhaps NTP time, or just reboot the board if we get to within a day of rollover.
   * Split .ino into multiple files for management - http://www.gammon.com.au/forum/?id=12625
   * OTA updates
-
+  * Watchdog timer -- if we have too many errors, just reboot the board (e.g. wifi failure to reconnect)
 
 
 **********************************************************/
 
 
-#define VERSION "0.2.0"
+#define VERSION "0.2.5"
 
 
 
@@ -50,6 +50,7 @@
 
 // code will fail to compile if neither of these is true, as no Wifi include is made
 
+// Huzzah 8266 does not work.  WifiEventInfo_t is not defined.  May need newer library to work properly
 #ifdef ARDUINO_ESP8266_ADAFRUIT_HUZZAH
 
 #define boardident "esp8266"
@@ -58,8 +59,10 @@
 
 #endif
 
+// ESP32 includes a library no longer supported and > 8 years old.  Perhaps ESP_Wifi is the replacement?  For now, it compiles.
 #ifdef ARDUINO_FEATHER_ESP32
 
+#define ESP32
 #define boardident "esp32"
 #define BOARDNAME "Adafruit Feather ESP32"
 #include <WiFi.h>
@@ -67,9 +70,13 @@
 #endif
 
 
-// save macaddr during setup()
-char macaddr[15] = "";
+// globals to save macaddr during setup()
+char longmac[32] = ""; // will contain colons
+char macaddr[15] = ""; // just hex digits
 
+boolean wifiReady = 0;
+boolean pleaseSendHardware = 0;   // e.g. Wifi reconnect
+boolean pleaseSendAutoconfig = 0; // e.g. (not yet supported; todo) -- serial number changes
 
 
 #include <PubSubClient.h>
@@ -107,6 +114,11 @@ SensirionI2CSen5x sen5x;
 boolean aqPresent = 0;            // Air Quality sensor present; set true if it's detected
 
 uint32_t delayEnviron;       // delay between re-reading value
+
+char envSerial[64] = "";    // serial number
+char envProduct[64] = "";
+char envFirmware[16] = "";
+char envHardware[16] = "";
 
 
 // Read Measurements
@@ -168,6 +180,12 @@ int sendStateNow = 0;             // env state changed, and should be sent asap
 
 
 
+unsigned long globalSettleTime = 30000;    // don't even post MQTT stats until this much time has passed
+unsigned long luxSettleTime = 30000;       // == global time; so no additional delay on lux
+unsigned long tempSettleTime = 120000;     // total delay of 2 minutes for temp; sensor has to adjust to internal heater
+unsigned long humiditySettleTime = 120000; // same
+unsigned long vocSettleTime = 60000;
+unsigned long noxSettleTime = 60000;
 
 // Timer to capture last poll of sensors
 // Set to 30s to avoid polling for 30s after booting to help data settle before reporting
@@ -261,22 +279,29 @@ String processor(const String& var){
 
 
 boolean mqttConnect() {
+
+  if (! wifiReady) { return 0; }
+  
   // if we are not already connected ...
   if (! mqttclient.connected() ) {
 
-    // ... and we didn't try to connect (and fail) too recently ...
-    if (millis() > nextMqttConnect) {
-    
+    // ... did we try to connect (and fail) too recently? ...
+    if (millis() < nextMqttConnect) {
+      return 0;
+    }
+    else {
       // ... then try to connect
       Serial.print("Connecting to MQTT broker ... ");
-  
-      if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass, "aq2mqtt/246F28035110/availability", 0, true, "offline") ) {  // todo: hardcoded - update to serial of sen5x
+
+      char topic[64];
+      sprintf(topic, "aq2mqtt/%s/availability", envSerial);   //TODO: revert to "macaddr" - if sensor gets disconnected, this breaks
+      if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass, topic, 0, true, "offline") ) {
         Serial.println("failed.");
         nextMqttConnect = millis() + 60000;   // next allowed in 60 seconds
         return false;
       }
       else {
-        mqttclient.publish("aq2mqtt/246F28035110/availability", "online", true); // no error checking on this one.
+        mqttclient.publish(topic, "online", true); // no error checking on this one.
         Serial.println("ok.");
 
         // try to set; and then read it back; if it wasn't able to be set we report when we try to use it
@@ -284,18 +309,21 @@ boolean mqttConnect() {
         mqttBufferSize = mqttclient.getBufferSize();
       
         char msg[32];
+        sprintf(topic, "aq2mqtt/%s/buffersize", envSerial);
         sprintf(msg, "%d", mqttBufferSize);
-        mqttclient.publish("aq2mqtt/246F28035110/buffersize", msg, false);
+        mqttclient.publish(topic, msg, false);
     
       }
-    
+
+      nextMqttConnect = 0;  // success; we can reconnect if needed at any time
+      
     }
 
-
+    
   }
 
-  nextMqttConnect = 0;  // success; we can reconnect if needed at any time
-  return true;
+  
+  return 1;
 
   
   
@@ -329,8 +357,8 @@ boolean mqttSendHardwareInfo() {
     "connection": { "ipaddr": "%d.%d.%d.%d", "macaddr": "%s" },
     "software": { "version": "%s", "compiledate": "%s", "compiletime": "%s" },
     "sensors": {
-       "lux": { "model": "veml7700" },
-       "env": { "model": "sen55", serial: "%s", firmware: "%s" }
+       "lux": { "model": "%s" },
+       "env": { "model": "%s", "serial": "%s", "hardware": "%s", "firmware": "%s" }
     }
 })";
 // end string
@@ -338,13 +366,13 @@ boolean mqttSendHardwareInfo() {
     sprintf(msg, json, 
       BOARDNAME,
       WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3],
-      macaddr,
+      longmac,
       __VERSION__, __DATE__, __TIME__,
-      "senserial",
-      "firm1.x"
+      luxPresent ? "veml7700" : "missing",
+      aqPresent ? envProduct : "missing", aqPresent ? envSerial : "", aqPresent ? envHardware : "", aqPresent ? envFirmware : ""
     );
 
-    sprintf(topic, "aq2mqtt/%s/hardware", macaddr);   // TODO: data should be tagged with serial number of the SEN5x, not the mac of the board.
+    sprintf(topic, "aq2mqtt/%s/hardware", envSerial);   // TODO: revert to mac of the board
 
     Serial.print("Sending MQTT hardware configuration info ... ");    
 
@@ -354,6 +382,7 @@ boolean mqttSendHardwareInfo() {
     }
     else {
       Serial.println("ok.");
+      pleaseSendHardware = 0;
     }
 
   return 1;
@@ -383,7 +412,7 @@ boolean mqttSendAutoconfig() {
 
   Serial.println("  Not yet supported.  Please autoconfig manually.");   // TODO, of course
 
-
+  pleaseSendAutoconfig = 0;
   return 1;
   
 }
@@ -400,25 +429,60 @@ boolean mqttSendState() {
   char topic[64];  // topic
   char msg[512];   // message
 
-  if ( millis() <  30000 ) {  // meterSendFreq ) {  //todo rename settleTime
-    
-    Serial.println("Waiting for sensors to settle...");
-    return 0;
-  }
-
-
-  // connect / reconnect if needed
+  unsigned long timeNow = millis();
+  
+  // connect / reconnect if needed - also ensures wifi is ready
   if (! mqttConnect()) {
     return 0;
   }
+
+
+  // Don't send *ANY* results until this long has passed
+  if ( timeNow <  globalSettleTime ) {
+
+    // cheap way to avoid spamming the output; still prints multiple times in the same millisecond.
+    if (timeNow % 5000 == 0) {
+      Serial.println("Waiting for sensors to settle...");
+    }
+    return 0;
+  }
+
+  // is the lux measurement good?  If not, don't report.
+  char luxstr[32] = "false";
+  if (luxGood && timeNow > luxSettleTime) {
+    sprintf(luxstr, "\"%0.2f\"", lux);
+  }
+
+  // is temp measurement good, has it settled, and do we have sensor present?
+  char tempstr[32] = "false";
+  if (! isnan(ambientTemperature) && timeNow > tempSettleTime && aqPresent) {
+    sprintf(tempstr, "\"%0.2f\"", ambientTemperature);
+  }
+
+  char humdstr[32] = "false";
+  if (! isnan(ambientHumidity) && timeNow > humiditySettleTime && aqPresent) {
+    sprintf(humdstr, "\"%0.2f\"", ambientHumidity);
+  }
+
+
+
+  char vocstr[32] = "false";
+  if (! isnan(vocIndex) && timeNow > vocSettleTime && aqPresent) {
+    sprintf(vocstr, "\"%0.2f\"", vocIndex);
+  }
+  
+  char noxstr[32] = "false";
+  if (! isnan(noxIndex) && timeNow > noxSettleTime && aqPresent) {
+    sprintf(noxstr, "\"%0.2f\"", noxIndex);
+  }
+  
   
 
-  
 // - literal json string
   const char* json = R"({
-   "env": { "lux": "%0.2f", "temp": "%0.2f", "humidity": "%0.2f" },
+   "env": { "lux": %s, "temp": %s, "humidity": %s },
    "particulate": { "pm1": "%0.2f", "pm25": "%0.2f", "pm4": "%0.2f", "pm10": "%0.2f" },
-   "index": { "voc": "%d", "nox": "%d" } 
+   "index": { "voc": %s, "nox": %s } 
 })";
 // end string
 
@@ -435,22 +499,20 @@ boolean mqttSendState() {
  //
  
     sprintf(msg, json, 
-      luxGood ? lux : -1,
-      isnan(ambientTemperature) ? -1 : ambientTemperature,
-      isnan(ambientHumidity) ? -1 : ambientHumidity,
-
+      luxstr,   // either blank string, or lux reading
+      tempstr, humdstr,
+      
       isnan(massConcentrationPm1p0) ? -1 : massConcentrationPm1p0,
       isnan(massConcentrationPm2p5) ? -1 : massConcentrationPm2p5,
       isnan(massConcentrationPm4p0) ? -1 : massConcentrationPm4p0,
       isnan(massConcentrationPm10p0) ? -1 : massConcentrationPm10p0,
-      
-      isnan(vocIndex) ? -1 : (int)vocIndex,
-      isnan(noxIndex) ? -1 : (int)noxIndex
 
+      vocstr, noxstr
+      
     );
 
 
-    sprintf(topic, "aq2mqtt/%s/state", macaddr);   // TODO: data should be tagged with serial number of the SEN5x, not the mac of the board.
+    sprintf(topic, "aq2mqtt/%s/state", envSerial);   // topic is tagged with the serial number of the environmental sensor (previously was mac of the board)
 
     
 		Serial.print("Sending MQTT state ... ");
@@ -461,7 +523,7 @@ boolean mqttSendState() {
     else {
 			Serial.println(" sent.");
 
-      // save the "last SENT values"
+      // save the "last SENT values" ... TODO this doesn't account for pre-settled updates where the values were not actually sent.
       lastLux = lux;
       lastTemperature = ambientTemperature;
       lastHumidity = ambientHumidity;
@@ -504,8 +566,9 @@ void printModuleVersions() {
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
     } else {
-        Serial.print("  ProductName: ");
-        Serial.println((char*)productName);
+        strcpy(envProduct, (char*)productName);  // store in global
+        Serial.print("  ProductName:  ");
+        Serial.println(envProduct);
     }
 
     uint8_t firmwareMajor; uint8_t firmwareMinor;
@@ -521,20 +584,9 @@ void printModuleVersions() {
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
     } else {
-        Serial.print("  Firmware: ");
-        Serial.print(firmwareMajor);
-        Serial.print(".");
-        Serial.print(firmwareMinor);
-        
-        Serial.print("  Hardware: ");
-        Serial.print(hardwareMajor);
-        Serial.print(".");
-        Serial.print(hardwareMinor);
-
-        Serial.print("  Protocol: ");
-        Serial.print(protocolMajor);
-        Serial.print(".");
-        Serial.println(protocolMinor);
+        // save for MQTT status page
+        sprintf(envFirmware, "%d.%d", firmwareMajor, firmwareMinor);
+        sprintf(envHardware, "%d.%d", hardwareMajor, hardwareMinor);
     }
 }
 
@@ -551,8 +603,9 @@ void printSerialNumber() {
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
     } else {
+        strcpy(envSerial, (char*)serialNumber);  // store in global
         Serial.print("  SerialNumber: ");
-        Serial.println((char*)serialNumber);
+        Serial.println(envSerial);
     }
 }
 
@@ -571,14 +624,65 @@ void pollsen() {
         Serial.print("Error trying to execute readMeasuredValues(): ");
         errorToString(error, errorMessage, 256);
         Serial.println(errorMessage);
+
+        // set all values to NaN
+        massConcentrationPm1p0 = NAN; //sqrt(-1);
+        massConcentrationPm2p5 = NAN; //sqrt(-1);
+        massConcentrationPm4p0 = sqrt(-1);
+        massConcentrationPm10p0 = sqrt(-1);
+
+        ambientHumidity = sqrt(-1);
+        ambientTemperature = sqrt(-1);
+        vocIndex = sqrt(-1);
+        noxIndex = sqrt(-1);
+
+        // disable -- TODO this is good for testing when I disconnect the cable.  need to update
+        // this to handle a few errors and just retry; then on too many either disable or reboot/reset.
+        aqPresent = 0;
+        pleaseSendHardware = 1;
+        
     }
 
     
     
+
+    // TODO: From observation only.
+    // if the sensor is being driven from 3v or 3.3v from the regular +V, and not the +5V directly from USB pin (exposed as "USB" pin)
+    // it is not able to drive the particle sensor portion
+    //
+    // all PM readings are exactly 6553.40
+    //
+    // TODO: if we get 6553.40 on all sensors at boot; disable the sensor
+    //
     
 
 
     
+}
+
+
+
+///
+
+// Wifi functions - https://microcontrollerslab.com/reconnect-esp32-to-wifi-after-lost-connection/
+
+void Wifi_connected(WiFiEvent_t event, WiFiEventInfo_t info){
+  Serial.println("Successfully connected to Access Point");
+}
+
+void Get_IPAddress(WiFiEvent_t event, WiFiEventInfo_t info){
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  wifiReady = 1;
+  pleaseSendHardware = 1;
+  pleaseSendAutoconfig = 1;
+}
+
+void Wifi_disconnected(WiFiEvent_t event, WiFiEventInfo_t info){
+  wifiReady = 0;
+  // TODO: by default this prints every few seconds; throttle to only print every few minutes
+  Serial.println("WiFi lost connection.  Reconnecting.");
+  WiFi.begin(wifiName, wifiPass);
 }
 
 
@@ -617,9 +721,10 @@ void setup() {
     Serial.println("Lux sensor found - initializing");
     veml.setGain(VEML7700_GAIN_1);
     veml.setIntegrationTime(VEML7700_IT_800MS);
-    
+
+    Serial.println("Product: VEML7700");
     Serial.print(F("  Gain: "));
-    switch (veml.getGain()) {
+    switch (veml.getGain()) {  // this is redundant, and copied from sample code; we set the values above; don't need to read it back
       case VEML7700_GAIN_1: Serial.println("1"); break;
       case VEML7700_GAIN_2: Serial.println("2"); break;
       case VEML7700_GAIN_1_4: Serial.println("1/4"); break;
@@ -652,7 +757,7 @@ void setup() {
   // SEN5x setup -- poll every 30 seconds
   delayEnviron = 30000;
 
-  // note -- sen5x uses the Wire to talk I2C, but veml7700 has something else internal
+  // note -- sen5x uses the "Wire" to talk I2C, but veml7700 has something else.  Both seem to work together fine.
   Wire.begin();
 
   sen5x.begin(Wire);
@@ -684,6 +789,7 @@ void setup() {
       Serial.println(errorMessage);
       // disable
       aqPresent = 0;
+      pleaseSendHardware = 1;
     }
     
   }
@@ -694,46 +800,49 @@ void setup() {
 
   
 	
-
-
-	Serial.print("Searching for wifi SSID ");
+  Serial.print("Searching for wifi SSID ");
   Serial.print(wifiName);
-  
+
+  WiFi.disconnect(true);
+  delay(100);
+
+#ifdef ESP32
+  WiFi.onEvent(Wifi_connected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(Get_IPAddress, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(Wifi_disconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+#else
+  // tested - does not work on ESP8266; missing WiFiEventInfo_t
+  WiFi.onEvent(Wifi_connected, SYSTEM_EVENT_STA_CONNECTED);
+  WiFi.onEvent(Get_IPAddress, SYSTEM_EVENT_STA_GOT_IP);
+  WiFi.onEvent(Wifi_disconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+
+#endif
+
 	WiFi.mode(WIFI_STA);
 	WiFi.begin(wifiName, wifiPass);
+ 
 	Serial.println("");
 
-	// Wait for connection to finish and print details.
-	while (WiFi.status() != WL_CONNECTED) {
-		delay(500);
-		Serial.print(".");
-	}
-	Serial.println("");
-	Serial.print("Connected - ");
-	Serial.println(WiFi.localIP());
-
-	// Read and save mac address one time since it won't change
-	char longmac[32];  // will contain colons, etc.
-	sprintf(longmac, WiFi.macAddress().c_str());
-	int i = 0; int j = 0; char c;
-	while ((c = longmac[i++]) != '\0' && j <= 12)
-		if (isalnum(c)) 
-			macaddr[j++] = c;
-	macaddr[j] = '\0';
-	
-
-  // MQTT identifier is esp32-(mac), or esp8266-(mac) for later use
-	sprintf(mqttIdent, "%s-%s", boardident, macaddr);
 
 
-  // we don't have measurements yet, but have confirmed whether hardware is present and
-  // can send our autoconfig JSON
-  mqttSendAutoconfig();
-
-  // Send board / hardware info
-  mqttSendHardwareInfo();
+  // Read and save mac address one time since it won't change
+  sprintf(longmac, WiFi.macAddress().c_str());
+  int i = 0; int j = 0; char c;
+  while ((c = longmac[i++]) != '\0' && j <= 12)
+    if (isalnum(c)) 
+      macaddr[j++] = c;
+  macaddr[j] = '\0';
   
+  // MQTT identifier is esp32-(mac), or esp8266-(mac) for later use
+  sprintf(mqttIdent, "%s-%s", boardident, macaddr);
 
+
+
+
+  // We do not need to wait for Wifi in setup(), but do need to make sure we don't use
+  // it to connect to the MQTT broker until we're connected.
+
+  
 }
 
 
@@ -747,6 +856,16 @@ void setup() {
 void loop()
 {
 
+  // request to send?
+  if (pleaseSendHardware) {
+    mqttSendHardwareInfo();
+  }
+
+  if (pleaseSendAutoconfig) {
+    mqttSendAutoconfig();
+  }
+ 
+ 
 
   bool readLux = 0;
   bool readEnv = 0;
@@ -761,6 +880,7 @@ void loop()
       Serial.println("Lux sensor out of range - disabling");
       luxPresent = 0;
       luxGood = 0;
+      pleaseSendHardware = 1; // update when we're ready
     } else {
       
       luxGood = 1;
@@ -810,28 +930,30 @@ void loop()
     }
 
     // be careful of divide by zero on comparisons
-    if ( (lastPM1  > 0 && massConcentrationPm1p0  > 0) && ( ( (lastPM1  / massConcentrationPm1p0) > 1.5)  || (lastPM1  / massConcentrationPm1p0) < 0.6) ) {
+    // 1.25 or 0.8 equals 25% above or below previous reading
+    
+    if ( (lastPM1  > 0 && massConcentrationPm1p0  > 0) && ( ( (lastPM1  / massConcentrationPm1p0) > 1.25)  || (lastPM1  / massConcentrationPm1p0) < 0.8) ) {
       sendStateNow = 1;
       pm1Changed = 1;
     }
     
-    if ( (lastPM25 > 0 && massConcentrationPm2p5  > 0) && ( ( (lastPM25 / massConcentrationPm2p5) > 1.5)  || (lastPM25 / massConcentrationPm2p5) < 0.6) ) {
+    if ( (lastPM25 > 0 && massConcentrationPm2p5  > 0) && ( ( (lastPM25 / massConcentrationPm2p5) > 1.25)  || (lastPM25 / massConcentrationPm2p5) < 0.8) ) {
       sendStateNow = 1;
       pm25Changed = 1;
     }
 
-    if ( (lastPM4  > 0 && massConcentrationPm4p0  > 0) && ( ( (lastPM4  / massConcentrationPm4p0) > 1.5)  || (lastPM4  / massConcentrationPm4p0) < 0.6) ) {
+    if ( (lastPM4  > 0 && massConcentrationPm4p0  > 0) && ( ( (lastPM4  / massConcentrationPm4p0) > 1.25)  || (lastPM4  / massConcentrationPm4p0) < 0.8) ) {
       sendStateNow = 1;
       pm4Changed = 1;
     }
 
-    if ( (lastPM10 > 0 && massConcentrationPm10p0 > 0) && ( ( (lastPM10 / massConcentrationPm10p0) > 1.5) || (lastPM10  / massConcentrationPm10p0) < 0.6) ) {
+    if ( (lastPM10 > 0 && massConcentrationPm10p0 > 0) && ( ( (lastPM10 / massConcentrationPm10p0) > 1.25) || (lastPM10  / massConcentrationPm10p0) < 0.8) ) {
       sendStateNow = 1;
       pm10Changed = 1;
     }
     
 
-    if ( (lastLux > 0 && lux > 0) && ( ( (lastLux / lux) > 1.5) || (lastLux  / lux) < 0.6) ) {
+    if ( (lastLux > 0 && lux > 0) && ( ( (lastLux / lux) > 1.25) || (lastLux  / lux) < 0.8) ) {
       sendStateNow = 1;
       luxChanged = 1;
     }
@@ -869,7 +991,8 @@ void loop()
 	
 	// if we became disconnected, flag to resend
 	if (! mqttclient.connected() ) {
-    Serial.println("MQTT became disconnected.");
+    // TODO: do not print every loop;
+    // Serial.println("MQTT became disconnected.");
     sendStateNow = 1;
 	}
  
@@ -880,7 +1003,6 @@ void loop()
 	if ( ( sendStateNow && millis() - lastEnvTime > envFreq && millis() > lastEnviron ) ||
 	     ( millis() - lastEnvTime > envForceFreq) ) {
 		
-		sendStateNow = 0;
 		
 		if (mqttSendState()) {
 		  lastEnvTime = millis();
