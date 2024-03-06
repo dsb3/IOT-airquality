@@ -74,7 +74,10 @@
 char longmac[32] = ""; // will contain colons
 char macaddr[15] = ""; // just hex digits
 
-boolean wifiReady = 0;
+
+boolean wifiConnected = 0;
+long wifiBeganAt = 0;  // millis() timestamp of when we tried to wifi connect
+
 boolean pleaseSendHardware = 0;   // e.g. Wifi reconnect
 boolean pleaseSendAutoconfig = 0; // e.g. (not yet supported; todo) -- serial number changes
 
@@ -90,14 +93,14 @@ boolean pleaseSendAutoconfig = 0; // e.g. (not yet supported; todo) -- serial nu
 
 // generate and save during setup()
 char mqttIdent[64] = "";
-
+char mqttPrefix[64] = "";
 
 // default value from headers; we need to increase this from default 256 bytes for oversize JSON data
 int mqttBufferSize = MQTT_MAX_PACKET_SIZE;
 
 
-
-
+// defaults to false; set to true if an environmental sensor is found
+boolean mqttRetain = false;
 
 
 
@@ -161,14 +164,26 @@ boolean luxChanged = 0;
 
 
 // VEML7700 produces actual lux value, as well as luminosity equivalent
+
 // if we fail to initialize, we disable the sensor and stop taking readings
 #include "Adafruit_VEML7700.h"
-
 Adafruit_VEML7700 veml = Adafruit_VEML7700();
-volatile boolean luxPresent = 0;   // hardware is present?
+
+
+#include "Wire.h"
+#include "Max44009.h"
+Max44009 maxLux(0x4a);  // default address (pull ident pin to ground)
+
+
+volatile boolean luxPresent = 0;   // any hardware is present?
 volatile boolean luxGood = 0;      // value read is good?
 volatile float lux = 0.0;
 uint32_t delayLuminance = 1000;    // read value every second
+
+
+boolean vemlPresent = 0; // specifically, veml7700 lux sensor found?
+boolean maxPresent = 0;   // specifically, max44009 lux sensor found?
+
 
 
 // Update environmental stats this many ms, unless prompted to update sooner
@@ -280,7 +295,7 @@ String processor(const String& var){
 
 boolean mqttConnect() {
 
-  if (! wifiReady) { return 0; }
+  if (! wifiConnected) { return 0; }
   
   // if we are not already connected ...
   if (! mqttclient.connected() ) {
@@ -294,14 +309,18 @@ boolean mqttConnect() {
       Serial.print("Connecting to MQTT broker ... ");
 
       char topic[64];
-      sprintf(topic, "aq2mqtt/%s/availability", envSerial);   //TODO: revert to "macaddr" - if sensor gets disconnected, this breaks
+
+      // todo: this should be a global mqttPrefix set one time, similar to mqttIdent and used for the life of the program
+      sprintf(topic, "%s/availability", mqttPrefix);
+            
+      
       if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass, topic, 0, true, "offline") ) {
         Serial.println("failed.");
         nextMqttConnect = millis() + 60000;   // next allowed in 60 seconds
         return false;
       }
       else {
-        mqttclient.publish(topic, "online", true); // no error checking on this one.
+        mqttclient.publish(topic, "online", mqttRetain); // no error checking on this one.
         Serial.println("ok.");
 
         // try to set; and then read it back; if it wasn't able to be set we report when we try to use it
@@ -309,7 +328,8 @@ boolean mqttConnect() {
         mqttBufferSize = mqttclient.getBufferSize();
       
         char msg[32];
-        sprintf(topic, "aq2mqtt/%s/buffersize", envSerial);
+        sprintf(topic, "%s/buffersize", mqttPrefix);
+      
         sprintf(msg, "%d", mqttBufferSize);
         mqttclient.publish(topic, msg, false);
     
@@ -368,15 +388,15 @@ boolean mqttSendHardwareInfo() {
       WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3],
       longmac,
       __VERSION__, __DATE__, __TIME__,
-      luxPresent ? "veml7700" : "missing",
+      vemlPresent ? "veml7700" : maxPresent ? "max4400x" : "missing",  // stacked ternary.
       aqPresent ? envProduct : "missing", aqPresent ? envSerial : "", aqPresent ? envHardware : "", aqPresent ? envFirmware : ""
     );
 
-    sprintf(topic, "aq2mqtt/%s/hardware", envSerial);   // TODO: revert to mac of the board
-
+    sprintf(topic, "%s/hardware", mqttPrefix);
+    
     Serial.print("Sending MQTT hardware configuration info ... ");    
 
-    if (! mqttclient.publish(topic, msg, true)) {
+    if (! mqttclient.publish(topic, msg, mqttRetain)) {
       Serial.println("failed to send.");
       return 0;
     }
@@ -394,11 +414,18 @@ boolean mqttSendHardwareInfo() {
 // General function to send autoconfig strings
 boolean mqttSendAutoconfig() {
 
+  // don't send autoconfig unless we have an environmental sensor
+  if (! aqPresent) {
+    Serial.println("  No environment sensor found; will not send autoconfiguration strings.");
+    pleaseSendAutoconfig = 0;
+    return 0;
+  }
+
   // connect / reconnect if needed
   if (! mqttConnect()) {
     return 0;
   }
-
+    
  
   char buff[64];
   char msg[32];
@@ -512,11 +539,11 @@ boolean mqttSendState() {
     );
 
 
-    sprintf(topic, "aq2mqtt/%s/state", envSerial);   // topic is tagged with the serial number of the environmental sensor (previously was mac of the board)
-
+    sprintf(topic, "%s/state", mqttPrefix);
+    
     
 		Serial.print("Sending MQTT state ... ");
-	  if (! mqttclient.publish(topic, msg, true)) {
+	  if (! mqttclient.publish(topic, msg, mqttRetain)) {
       Serial.println("failed to send.");
       return 0;
     }
@@ -626,15 +653,15 @@ void pollsen() {
         Serial.println(errorMessage);
 
         // set all values to NaN
-        massConcentrationPm1p0 = NAN; //sqrt(-1);
-        massConcentrationPm2p5 = NAN; //sqrt(-1);
-        massConcentrationPm4p0 = sqrt(-1);
-        massConcentrationPm10p0 = sqrt(-1);
+        massConcentrationPm1p0 = NAN;
+        massConcentrationPm2p5 = NAN;
+        massConcentrationPm4p0 = NAN;
+        massConcentrationPm10p0 = NAN;
 
-        ambientHumidity = sqrt(-1);
-        ambientTemperature = sqrt(-1);
-        vocIndex = sqrt(-1);
-        noxIndex = sqrt(-1);
+        ambientHumidity = NAN;
+        ambientTemperature = NAN;
+        vocIndex = NAN;
+        noxIndex = NAN;
 
         // disable -- TODO this is good for testing when I disconnect the cable.  need to update
         // this to handle a few errors and just retry; then on too many either disable or reboot/reset.
@@ -662,32 +689,6 @@ void pollsen() {
 
 
 
-///
-
-// Wifi functions - https://microcontrollerslab.com/reconnect-esp32-to-wifi-after-lost-connection/
-
-void Wifi_connected(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("Successfully connected to Access Point");
-}
-
-void Get_IPAddress(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  wifiReady = 1;
-  pleaseSendHardware = 1;
-  pleaseSendAutoconfig = 1;
-}
-
-void Wifi_disconnected(WiFiEvent_t event, WiFiEventInfo_t info){
-  wifiReady = 0;
-  // TODO: by default this prints every few seconds; throttle to only print every few minutes
-  Serial.println("WiFi lost connection.  Reconnecting.");
-  WiFi.begin(wifiName, wifiPass);
-}
-
-
-///
-
 
 void setup() {
 	// Setup
@@ -713,51 +714,44 @@ void setup() {
   // it starts giving unreasonably high readings.  If we see this, we can
   // just disable it and flag as "unavailable".
   if (!veml.begin()) {
-    Serial.println("Lux sensor not found");
-    luxPresent = 0;
+    Serial.println("veml lux sensor not found");
+    vemlPresent = 0;
   }
   else {
-    luxPresent = 1;
-    Serial.println("Lux sensor found - initializing");
+    vemlPresent = 1;
+    Serial.println("veml lux sensor found");
     veml.setGain(VEML7700_GAIN_1);
     veml.setIntegrationTime(VEML7700_IT_800MS);
 
     Serial.println("Product: VEML7700");
-    Serial.print(F("  Gain: "));
-    switch (veml.getGain()) {  // this is redundant, and copied from sample code; we set the values above; don't need to read it back
-      case VEML7700_GAIN_1: Serial.println("1"); break;
-      case VEML7700_GAIN_2: Serial.println("2"); break;
-      case VEML7700_GAIN_1_4: Serial.println("1/4"); break;
-      case VEML7700_GAIN_1_8: Serial.println("1/8"); break;
-    }
+    //Serial.println("  Gain: 1  Integration Time: 800ms"); // literally what we just set them to.
     
-    Serial.print(F("  Integration Time (ms): "));
-    switch (veml.getIntegrationTime()) {
-      case VEML7700_IT_25MS: Serial.println("25"); break;
-      case VEML7700_IT_50MS: Serial.println("50"); break;
-      case VEML7700_IT_100MS: Serial.println("100"); break;
-      case VEML7700_IT_200MS: Serial.println("200"); break;
-      case VEML7700_IT_400MS: Serial.println("400"); break;
-      case VEML7700_IT_800MS: Serial.println("800"); break;
-    }
-    
-    //veml.powerSaveEnable(true);
-    //veml.setPowerSaveMode(VEML7700_POWERSAVE_MODE4);
-    
-    // Disabling these - we poll frequently enough to not need interrupts
-    //veml.setLowThreshold(10000);
-    //veml.setHighThreshold(20000);
-    //veml.interruptEnable(true);
-
-    Serial.println("");
   } // setup lux
 
+  // setup alternate lux
+  lux = maxLux.getLux();
+  int err = maxLux.getError();
+  if (err != 0) {
+    Serial.println("MAX4400x lux sensor not found");
+  }
+  else {
+    Serial.println("MAX4400x lux sensor found");
+    maxPresent = 1;
+  }
+  
+
+
+  // todo handle this better
+  if (vemlPresent || maxPresent) {
+    luxPresent = 1;
+  }
 
 
   // SEN5x setup -- poll every 30 seconds
   delayEnviron = 30000;
 
   // note -- sen5x uses the "Wire" to talk I2C, but veml7700 has something else.  Both seem to work together fine.
+  // max4400x also uses Wire
   Wire.begin();
 
   sen5x.begin(Wire);
@@ -773,6 +767,7 @@ void setup() {
     }
     else {
       aqPresent = 1;
+      mqttRetain = true;
     }
 
   if (aqPresent) {
@@ -801,29 +796,17 @@ void setup() {
   
 	
   Serial.print("Searching for wifi SSID ");
-  Serial.print(wifiName);
+  Serial.println(wifiName);
 
   WiFi.disconnect(true);
   delay(100);
 
-#ifdef ESP32
-  WiFi.onEvent(Wifi_connected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
-  WiFi.onEvent(Get_IPAddress, ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.onEvent(Wifi_disconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-#else
-  // tested - does not work on ESP8266; missing WiFiEventInfo_t
-  WiFi.onEvent(Wifi_connected, SYSTEM_EVENT_STA_CONNECTED);
-  WiFi.onEvent(Get_IPAddress, SYSTEM_EVENT_STA_GOT_IP);
-  WiFi.onEvent(Wifi_disconnected, SYSTEM_EVENT_STA_DISCONNECTED);
 
-#endif
-
+  // Begin wifi connection, but do not wait for it to connect
 	WiFi.mode(WIFI_STA);
 	WiFi.begin(wifiName, wifiPass);
- 
-	Serial.println("");
-
-
+	wifiBeganAt = millis();
+  wifiConnected = 0;
 
   // Read and save mac address one time since it won't change
   sprintf(longmac, WiFi.macAddress().c_str());
@@ -836,12 +819,9 @@ void setup() {
   // MQTT identifier is esp32-(mac), or esp8266-(mac) for later use
   sprintf(mqttIdent, "%s-%s", boardident, macaddr);
 
-
-
-
-  // We do not need to wait for Wifi in setup(), but do need to make sure we don't use
-  // it to connect to the MQTT broker until we're connected.
-
+  // MQTT prefix is either aq2mqtt/SERIAL if we have sen5x present, else it's aq2mqtt/MAC
+  sprintf(mqttPrefix, "aq2mqtt/%s", aqPresent ? envSerial : macaddr);
+  Serial.print("Using MQTT prefix: "); Serial.println(mqttPrefix);
   
 }
 
@@ -856,14 +836,47 @@ void setup() {
 void loop()
 {
 
-  // request to send?
-  if (pleaseSendHardware) {
-    mqttSendHardwareInfo();
-  }
 
-  if (pleaseSendAutoconfig) {
-    mqttSendAutoconfig();
+  // TODO: this is possibly heavy-handed to check WL_CONNECTED on every loop.
+  // add a timer to only check every x seconds ... 15?
+
+  // hackery -- WiFi.status() might be an expensive call, so we crudely squelch how many times we run it
+  if (millis() % 15000 < 10) {
+    // are we connected to wifi?
+    if (WiFi.status() == WL_CONNECTED) {
+    
+      // ... do we think we're not?!  (i.e. did we just connect?)
+      if (! wifiConnected) { 
+         Serial.println("Connected to wifi");
+         wifiConnected = 1;
+         pleaseSendHardware = 1;
+         pleaseSendAutoconfig = 1;
+
+      }
+
+    }
+    // else we aren't connected; do we need to reset to attempt to reconnect?
+    else {
+      wifiConnected = 0;
+
+      // TODO: if we try to reconnect too many times (> 1000?) just reboot the board.
+      if (millis() > wifiBeganAt + 60000) {
+        Serial.println("Wifi is disconnected; trying to reconnect");
+        WiFi.disconnect(true);
+        delay(100);
+        
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(wifiName, wifiPass);
+        wifiBeganAt = millis();
+  
+      }
+    }
   }
+    
+  // request to send?  Each function is responsible for resetting the flag.
+  if (pleaseSendHardware) {   mqttSendHardwareInfo(); }
+  if (pleaseSendAutoconfig) { mqttSendAutoconfig();   }
+
  
  
 
@@ -871,23 +884,34 @@ void loop()
   bool readEnv = 0;
 
   // todo - we can read lux more often.  perhaps every 2.5 seconds versus 5.0 for envs.
-    if (millis() - lastEnviron > delayEnviron && luxPresent) {
+  if (millis() - lastEnviron > delayEnviron && luxPresent) {
 
-    // poll lux sensor
-    lux = veml.readLux();
-
-    if (lux > 500000000) {  // from observation errors == 989560448.00
-      Serial.println("Lux sensor out of range - disabling");
-      luxPresent = 0;
-      luxGood = 0;
-      pleaseSendHardware = 1; // update when we're ready
-    } else {
-      
+    if (maxPresent) {
+      // poll other sensor
+      // todo - read both sensors; error check each one.
+      lux = maxLux.getLux();
       luxGood = 1;
+      readLux = 1;
     }
 
-    readLux = 1;
-  }
+
+    if (vemlPresent) {
+      // poll lux sensor
+      lux = veml.readLux();
+
+      if (lux > 500000000) {  // from observation errors == 989560448.00
+        Serial.println("veml lux sensor is out of range - disabling");
+        luxPresent = 0;
+        luxGood = 0;
+        pleaseSendHardware = 1; // update when we're ready
+      } else {
+    
+        luxGood = 1;
+      }
+
+      readLux = 1;
+    }
+  }  
 
 
   if (millis() - lastEnviron > delayEnviron && aqPresent) {
