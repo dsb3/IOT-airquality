@@ -36,7 +36,7 @@
 **********************************************************/
 
 
-#define VERSION "0.2.5"
+#define VERSION "0.3.0"
 
 
 
@@ -92,7 +92,6 @@ boolean pleaseSendAutoconfig = 0; // e.g. (not yet supported; todo) -- serial nu
 //const char* mqttPass = "password";
 
 // generate and save during setup()
-char mqttIdent[64] = "";
 char mqttPrefix[64] = "";
 
 // default value from headers; we need to increase this from default 256 bytes for oversize JSON data
@@ -159,6 +158,9 @@ boolean luxChanged = 0;
 
     
 
+// For home assistant auto-connect strings, we include json templates as raw string
+#include "json/all.h"
+
 
 
 
@@ -181,7 +183,7 @@ volatile float lux = 0.0;
 uint32_t delayLuminance = 1000;    // read value every second
 
 
-boolean vemlPresent = 0; // specifically, veml7700 lux sensor found?
+boolean vemlPresent = 0;  // specifically, veml7700 lux sensor found?
 boolean maxPresent = 0;   // specifically, max44009 lux sensor found?
 
 
@@ -201,6 +203,8 @@ unsigned long tempSettleTime = 120000;     // total delay of 2 minutes for temp;
 unsigned long humiditySettleTime = 120000; // same
 unsigned long vocSettleTime = 60000;
 unsigned long noxSettleTime = 60000;
+unsigned long pmSettleTime = 120000;
+
 
 // Timer to capture last poll of sensors
 // Set to 30s to avoid polling for 30s after booting to help data settle before reporting
@@ -241,12 +245,9 @@ PubSubClient mqttclient(mqttServer, mqttPort, mqttCallback, espClient);
 String processor(const String& var){
 	char buffer[50];
 	
-	if(var == "MILLIS") {
-		sprintf(buffer, "%d", millis());
-	}
  
 	// TODO: millis() will rollover every ~50 days.  Use NTP here.
-	else if (var == "UPTIME") {
+	if (var == "UPTIME") {
 		unsigned long m = millis();
 		
 		// > 1 day
@@ -308,13 +309,13 @@ boolean mqttConnect() {
       // ... then try to connect
       Serial.print("Connecting to MQTT broker ... ");
 
-      char topic[64];
+      char topic[128];
 
-      // todo: this should be a global mqttPrefix set one time, similar to mqttIdent and used for the life of the program
-      sprintf(topic, "%s/availability", mqttPrefix);
+
+      sprintf(topic, "aq2mqtt/%s/availability", mqttPrefix);
             
-      
-      if (! mqttclient.connect(mqttIdent, mqttUser, mqttPass, topic, 0, true, "offline") ) {
+      // use the macaddr as the ident for logging in to help distinguish
+      if (! mqttclient.connect(macaddr, mqttUser, mqttPass, topic, 0, true, "offline") ) {
         Serial.println("failed.");
         nextMqttConnect = millis() + 60000;   // next allowed in 60 seconds
         return false;
@@ -328,10 +329,10 @@ boolean mqttConnect() {
         mqttBufferSize = mqttclient.getBufferSize();
       
         char msg[32];
-        sprintf(topic, "%s/buffersize", mqttPrefix);
+        sprintf(topic, "aq2mqtt/%s/buffersize", mqttPrefix);
       
         sprintf(msg, "%d", mqttBufferSize);
-        mqttclient.publish(topic, msg, false);
+        mqttclient.publish(topic, msg, false);  // never retain 
     
       }
 
@@ -363,8 +364,8 @@ boolean mqttSendHardwareInfo() {
     return 0;
   }
  
-  char topic[64];
-  char msg[512];
+  char topic[128];
+  char msg[1024];
 
   if (mqttBufferSize < 512) {
     Serial.println("MQTT Buffer not big enough for hardware information string.  Not sent.");
@@ -392,7 +393,7 @@ boolean mqttSendHardwareInfo() {
       aqPresent ? envProduct : "missing", aqPresent ? envSerial : "", aqPresent ? envHardware : "", aqPresent ? envFirmware : ""
     );
 
-    sprintf(topic, "%s/hardware", mqttPrefix);
+    sprintf(topic, "aq2mqtt/%s/hardware", mqttPrefix);
     
     Serial.print("Sending MQTT hardware configuration info ... ");    
 
@@ -425,10 +426,7 @@ boolean mqttSendAutoconfig() {
   if (! mqttConnect()) {
     return 0;
   }
-    
- 
-  char buff[64];
-  char msg[32];
+
 
   Serial.print("Sending MQTT autoconfiguration strings ... ");
 
@@ -453,7 +451,7 @@ boolean mqttSendAutoconfig() {
 //
 boolean mqttSendState() {
 
-  char topic[64];  // topic
+  char topic[128];  // topic
   char msg[512];   // message
 
   unsigned long timeNow = millis();
@@ -476,7 +474,7 @@ boolean mqttSendState() {
 
   // is the lux measurement good?  If not, don't report.
   char luxstr[32] = "false";
-  if (luxGood && timeNow > luxSettleTime) {
+  if (luxGood && ! isnan(lux) && timeNow > luxSettleTime) {
     sprintf(luxstr, "\"%0.2f\"", lux);
   }
 
@@ -494,21 +492,49 @@ boolean mqttSendState() {
 
 
   char vocstr[32] = "false";
-  if (! isnan(vocIndex) && timeNow > vocSettleTime && aqPresent) {
+  if (timeNow > vocSettleTime && aqPresent) {
     sprintf(vocstr, "\"%0.2f\"", vocIndex);
   }
   
   char noxstr[32] = "false";
-  if (! isnan(noxIndex) && timeNow > noxSettleTime && aqPresent) {
+  if (timeNow > noxSettleTime && aqPresent) {
     sprintf(noxstr, "\"%0.2f\"", noxIndex);
   }
   
+  char pm1str[32] = "false";
+  if (! isnan(massConcentrationPm1p0) && timeNow > pmSettleTime && aqPresent) {
+    sprintf(pm1str, "\"%0.2f\"", massConcentrationPm1p0);
+  }
+
+  char pm25str[32] = "false";
+  if (! isnan(massConcentrationPm2p5) && timeNow > pmSettleTime && aqPresent) {
+    sprintf(pm25str, "\"%0.2f\"", massConcentrationPm2p5);
+  }
+
+  char pm4str[32] = "false";
+  if (! isnan(massConcentrationPm4p0) && timeNow > pmSettleTime && aqPresent) {
+    sprintf(pm4str, "\"%0.2f\"", massConcentrationPm4p0);
+  }
+
+  char pm10str[32] = "false";
+  if (! isnan(massConcentrationPm10p0) && timeNow > pmSettleTime && aqPresent) {
+    sprintf(pm10str, "\"%0.2f\"", massConcentrationPm10p0);
+  }
+
+
+  // DEBUG
+  Serial.print("debug pm1:  "); Serial.print(massConcentrationPm1p0); Serial.print(" .. "); Serial.println(pm1str);
+  Serial.print("debug pm25: "); Serial.print(massConcentrationPm2p5); Serial.print(" .. "); Serial.println(pm25str);
+  Serial.print("debug pm4:  "); Serial.print(massConcentrationPm4p0); Serial.print(" .. "); Serial.println(pm4str);
+  Serial.print("debug pm10: "); Serial.print(massConcentrationPm10p0); Serial.print(" .. "); Serial.println(pm10str);
+  
   
 
+// TODO - split lux into it's own subsection - separate topic
 // - literal json string
   const char* json = R"({
    "env": { "lux": %s, "temp": %s, "humidity": %s },
-   "particulate": { "pm1": "%0.2f", "pm25": "%0.2f", "pm4": "%0.2f", "pm10": "%0.2f" },
+   "particulate": { "pm1": %s, "pm25": %s, "pm4": %s, "pm10": %s },
    "index": { "voc": %s, "nox": %s } 
 })";
 // end string
@@ -528,28 +554,31 @@ boolean mqttSendState() {
     sprintf(msg, json, 
       luxstr,   // either blank string, or lux reading
       tempstr, humdstr,
-      
-      isnan(massConcentrationPm1p0) ? -1 : massConcentrationPm1p0,
-      isnan(massConcentrationPm2p5) ? -1 : massConcentrationPm2p5,
-      isnan(massConcentrationPm4p0) ? -1 : massConcentrationPm4p0,
-      isnan(massConcentrationPm10p0) ? -1 : massConcentrationPm10p0,
 
+      pm1str, pm25str, pm4str, pm10str,
+      
       vocstr, noxstr
       
     );
 
 
-    sprintf(topic, "%s/state", mqttPrefix);
+    sprintf(topic, "aq2mqtt/%s/state", mqttPrefix);
     
     
 		Serial.print("Sending MQTT state ... ");
+
+    
+    //debug
+    Serial.println(msg);
+
+      
 	  if (! mqttclient.publish(topic, msg, mqttRetain)) {
       Serial.println("failed to send.");
       return 0;
     }
     else {
 			Serial.println(" sent.");
-
+      
       // save the "last SENT values" ... TODO this doesn't account for pre-settled updates where the values were not actually sent.
       lastLux = lux;
       lastTemperature = ambientTemperature;
@@ -641,12 +670,39 @@ void pollsen() {
     uint16_t error;
     char errorMessage[256];
 
-
+    // for SEN55 all results are returned
+    // for SEN54 that doesn't have Nox sensor, this will simply return NaN
+    // for SEN50 the voc, nox, temp and humidity will all return NaN (not tested)
     error = sen5x.readMeasuredValues(
         massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0,
         massConcentrationPm10p0, ambientHumidity, ambientTemperature, vocIndex,
         noxIndex);
 
+    // SEN55 never gave bad results but SEN54 sporadically gives PM4 readings of many many trillions
+    // pm4p0 is 2710005891851421837524307892533077921087353760576515713248100224612019568051876683593062928135016576194812553037362042279289970380925207937771889983508191242604637464353782051894360918965252121427968.00
+    // pm10p0 is -0.00
+
+    // DEBUG
+    Serial.print("Temp:  "); Serial.println(ambientTemperature);
+    Serial.print("Humd:  "); Serial.println(ambientHumidity);
+    Serial.print("Voc:   "); Serial.println(vocIndex);
+    Serial.print("Nox:   "); Serial.println(noxIndex);
+    Serial.print("PM1:   "); Serial.println(massConcentrationPm1p0);
+    Serial.print("PM25:  "); Serial.println(massConcentrationPm2p5);
+    Serial.print("PM4:   "); Serial.println(massConcentrationPm4p0);
+    Serial.print("PM10:  "); Serial.println(massConcentrationPm10p0);
+    Serial.print("Error: "); Serial.println(error);
+    
+    if (massConcentrationPm1p0 > 1000000 || massConcentrationPm2p5 > 1000000 || massConcentrationPm4p0 > 1000000 || massConcentrationPm10p0 > 1000000 ||
+        massConcentrationPm1p0 < 0 || massConcentrationPm2p5 < 0 || massConcentrationPm4p0 < 0 || massConcentrationPm10p0 < 0) {
+        Serial.println("Bad PM measurements were found, and ignored");
+        massConcentrationPm1p0 = NAN;
+        massConcentrationPm2p5 = NAN;
+        massConcentrationPm4p0 = NAN;
+        massConcentrationPm10p0 = NAN;
+    }          
+
+    
     if (error) {
         Serial.print("Error trying to execute readMeasuredValues(): ");
         errorToString(error, errorMessage, 256);
@@ -664,18 +720,17 @@ void pollsen() {
         noxIndex = NAN;
 
         // disable -- TODO this is good for testing when I disconnect the cable.  need to update
-        // this to handle a few errors and just retry; then on too many either disable or reboot/reset.
+        // this to handle a few real errors and just retry; then on too many either disable or reboot/reset.
         aqPresent = 0;
         pleaseSendHardware = 1;
         
     }
 
-    
-    
+
 
     // TODO: From observation only.
     // if the sensor is being driven from 3v or 3.3v from the regular +V, and not the +5V directly from USB pin (exposed as "USB" pin)
-    // it is not able to drive the particle sensor portion
+    // it doesn't have enough power to drive the particle sensor portion (possibly also the voc/nox).
     //
     // all PM readings are exactly 6553.40
     //
@@ -713,13 +768,9 @@ void setup() {
   // TODO: in testing, if I unplug the lux sensor after the board boots, 
   // it starts giving unreasonably high readings.  If we see this, we can
   // just disable it and flag as "unavailable".
-  if (!veml.begin()) {
-    Serial.println("veml lux sensor not found");
-    vemlPresent = 0;
-  }
-  else {
+  if (veml.begin()) {
     vemlPresent = 1;
-    Serial.println("veml lux sensor found");
+    Serial.println("Lux sensor found");
     veml.setGain(VEML7700_GAIN_1);
     veml.setIntegrationTime(VEML7700_IT_800MS);
 
@@ -731,19 +782,22 @@ void setup() {
   // setup alternate lux
   lux = maxLux.getLux();
   int err = maxLux.getError();
-  if (err != 0) {
-    Serial.println("MAX4400x lux sensor not found");
-  }
-  else {
-    Serial.println("MAX4400x lux sensor found");
+  if (err == 0) {
+    Serial.println("Lux sensor found");
+    Serial.println("Product: MAX4400x");
     maxPresent = 1;
   }
   
 
+  Serial.println();
+  
 
   // todo handle this better
   if (vemlPresent || maxPresent) {
     luxPresent = 1;
+  }
+  else {
+    lux = NAN;
   }
 
 
@@ -816,11 +870,14 @@ void setup() {
       macaddr[j++] = c;
   macaddr[j] = '\0';
   
-  // MQTT identifier is esp32-(mac), or esp8266-(mac) for later use
-  sprintf(mqttIdent, "%s-%s", boardident, macaddr);
 
   // MQTT prefix is either aq2mqtt/SERIAL if we have sen5x present, else it's aq2mqtt/MAC
-  sprintf(mqttPrefix, "aq2mqtt/%s", aqPresent ? envSerial : macaddr);
+  sprintf(mqttPrefix, "%s", aqPresent ? envSerial : macaddr);
+
+  // I keep going back and forth on this -- for now I'm reverting to just/always using the board mac
+  //sprintf(mqttPrefix, "%s", macaddr);
+
+  
   Serial.print("Using MQTT prefix: "); Serial.println(mqttPrefix);
   
 }
@@ -932,23 +989,27 @@ void loop()
     //
     // We also save which value changed to flag it in the diagnostic output.
     //
-    
-    if (abs(lastTemperature - ambientTemperature) >= 0.4) {
+
+    // handle SEN50 which might not have this reading
+    if (! isnan(ambientTemperature) && abs(lastTemperature - ambientTemperature) >= 0.4) {
       sendStateNow = 1;
       temperatureChanged = 1;
     }
 
-    if (abs(lastHumidity - ambientHumidity) >= 4) {
+    // handle SEN50 which might not have this reading
+    if (! isnan(ambientHumidity) && abs(lastHumidity - ambientHumidity) >= 4) {
       sendStateNow = 1;
       humidityChanged = 1;
     }
 
-    if (abs(lastVoc - vocIndex) > 5) {
+    // handle SEN50 which might not have this reading
+    if (! isnan(vocIndex) && abs(lastVoc - vocIndex) > 5) {
       sendStateNow = 1;
       vocChanged = 1;
     }
 
-    if (abs(lastNox - noxIndex) > 5) {
+    // handle SEN54 which might not have this reading
+    if (! isnan(noxIndex) && ! isnan(lastNox) && abs(lastNox - noxIndex) > 5) {
       sendStateNow = 1;
       noxChanged = 1;
     }
@@ -992,14 +1053,21 @@ void loop()
       Serial.print("\t RH: ");     Serial.print(humidityChanged ? "*" : "");    Serial.print(ambientHumidity);
       
       Serial.print("\t Voc: ");    Serial.print(vocChanged ? "*" : "");         Serial.print(vocIndex);
-      Serial.print("\t Nox: ");    Serial.print(noxChanged ? "*" : "");         Serial.print(noxIndex);
+
+      // handle SEN54 which returns NAN for noxIndex.  TODO: handle elsewhere in code to also support SEN50 properly.
+      if (! isnan(noxIndex)) {
+        Serial.print("\t Nox: ");  Serial.print(noxChanged ? "*" : "");         Serial.print(noxIndex);
+      }
       
       Serial.print("\t PM1: ");    Serial.print(pm1Changed ? "*" : "");         Serial.print(massConcentrationPm1p0);
       Serial.print("\t PM2.5: ");  Serial.print(pm25Changed ? "*" : "");        Serial.print(massConcentrationPm2p5);
       Serial.print("\t PM4: ");    Serial.print(pm4Changed ? "*" : "");         Serial.print(massConcentrationPm4p0);
       Serial.print("\t PM10: ");   Serial.print(pm10Changed ? "*" : "");        Serial.print(massConcentrationPm10p0);
       
-      Serial.print("\t Lux: ");    Serial.print(luxChanged ? "*" : "");         Serial.print(lux);
+      if (luxPresent && ! isnan(lux)) {
+        Serial.print("\t Lux: ");  Serial.print(luxChanged ? "*" : "");         Serial.print(lux);
+      }
+      
       Serial.println("");
     }  
 
