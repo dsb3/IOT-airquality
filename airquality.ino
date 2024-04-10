@@ -671,12 +671,7 @@ void pollsen() {
         massConcentrationPm10p0, ambientHumidity, ambientTemperature, vocIndex,
         noxIndex);
 
-    // SEN55 never gave bad results but SEN54 sporadically gives PM4 readings of many many trillions
-    // pm4p0 is 2710005891851421837524307892533077921087353760576515713248100224612019568051876683593062928135016576194812553037362042279289970380925207937771889983508191242604637464353782051894360918965252121427968.00
-    // pm10p0 is -0.00
-
-    // UPDATE -- the problem was inconsistent update of a sprintf where a string was passed to %f by mistake.
-  
+    
     if (error) {
         Serial.print("Error trying to execute readMeasuredValues(): ");
         errorToString(error, errorMessage, 256);
