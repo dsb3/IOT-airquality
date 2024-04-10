@@ -522,13 +522,6 @@ boolean mqttSendState() {
   }
 
 
-  // DEBUG
-  Serial.print("debug pm1:  "); Serial.print(massConcentrationPm1p0); Serial.print(" .. "); Serial.println(pm1str);
-  Serial.print("debug pm25: "); Serial.print(massConcentrationPm2p5); Serial.print(" .. "); Serial.println(pm25str);
-  Serial.print("debug pm4:  "); Serial.print(massConcentrationPm4p0); Serial.print(" .. "); Serial.println(pm4str);
-  Serial.print("debug pm10: "); Serial.print(massConcentrationPm10p0); Serial.print(" .. "); Serial.println(pm10str);
-  
-  
 
 // TODO - split lux into it's own subsection - separate topic
 // - literal json string
@@ -569,7 +562,7 @@ boolean mqttSendState() {
 
     
     //debug
-    Serial.println(msg);
+    //Serial.println(msg);
 
       
 	  if (! mqttclient.publish(topic, msg, mqttRetain)) {
@@ -682,27 +675,8 @@ void pollsen() {
     // pm4p0 is 2710005891851421837524307892533077921087353760576515713248100224612019568051876683593062928135016576194812553037362042279289970380925207937771889983508191242604637464353782051894360918965252121427968.00
     // pm10p0 is -0.00
 
-    // DEBUG
-    Serial.print("Temp:  "); Serial.println(ambientTemperature);
-    Serial.print("Humd:  "); Serial.println(ambientHumidity);
-    Serial.print("Voc:   "); Serial.println(vocIndex);
-    Serial.print("Nox:   "); Serial.println(noxIndex);
-    Serial.print("PM1:   "); Serial.println(massConcentrationPm1p0);
-    Serial.print("PM25:  "); Serial.println(massConcentrationPm2p5);
-    Serial.print("PM4:   "); Serial.println(massConcentrationPm4p0);
-    Serial.print("PM10:  "); Serial.println(massConcentrationPm10p0);
-    Serial.print("Error: "); Serial.println(error);
-    
-    if (massConcentrationPm1p0 > 1000000 || massConcentrationPm2p5 > 1000000 || massConcentrationPm4p0 > 1000000 || massConcentrationPm10p0 > 1000000 ||
-        massConcentrationPm1p0 < 0 || massConcentrationPm2p5 < 0 || massConcentrationPm4p0 < 0 || massConcentrationPm10p0 < 0) {
-        Serial.println("Bad PM measurements were found, and ignored");
-        massConcentrationPm1p0 = NAN;
-        massConcentrationPm2p5 = NAN;
-        massConcentrationPm4p0 = NAN;
-        massConcentrationPm10p0 = NAN;
-    }          
-
-    
+    // UPDATE -- the problem was inconsistent update of a sprintf where a string was passed to %f by mistake.
+  
     if (error) {
         Serial.print("Error trying to execute readMeasuredValues(): ");
         errorToString(error, errorMessage, 256);
