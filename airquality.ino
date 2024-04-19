@@ -36,7 +36,7 @@
 **********************************************************/
 
 
-#define VERSION "0.3.0"
+#define VERSION "0.3.1"
 
 
 
@@ -114,6 +114,9 @@ SensirionI2CSen5x sen5x;
 
 
 boolean aqPresent = 0;            // Air Quality sensor present; set true if it's detected
+int aqErrors = 0;                 // number of errors seen when reading aq values
+int aqReadings = 0;               // cumulative count of number of readings taken
+
 
 uint32_t delayEnviron;       // delay between re-reading value
 
@@ -351,6 +354,45 @@ boolean mqttConnect() {
 }
 
 
+
+// General function to send an error message to MQTT broker for remote diagnostics
+boolean mqttSendError(const char* inputmsg) {
+
+  // connect / reconnect if needed
+  if (! mqttConnect()) {
+    return 0;
+  }
+ 
+  char topic[128];
+  char msg[1024];   // Max length will actually be 256 chars for inputmsg plus markup.  Actual messages are shorter.
+
+// - literal json string
+  const char* json = R"({ "msg": "%s" })";
+// end string
+
+
+    sprintf(msg, json, inputmsg);
+
+    sprintf(topic, "aq2mqtt/%s/error", mqttPrefix);
+    
+    Serial.print("Sending MQTT error message ... ");    
+    Serial.print(msg);
+
+    if (! mqttclient.publish(topic, msg, mqttRetain)) {
+      Serial.println(" ... failed to send.");
+      return 0;
+    }
+    else {
+      Serial.println(" ... ok.");
+    }
+
+  return 1;
+  
+}
+
+
+
+
 // General function to send hardware configuration
 //
 // TODO - some of these values may change; if that happens, detect and resend
@@ -379,7 +421,7 @@ boolean mqttSendHardwareInfo() {
     "software": { "version": "%s", "compiledate": "%s", "compiletime": "%s" },
     "sensors": {
        "lux": { "model": "%s" },
-       "env": { "model": "%s", "serial": "%s", "hardware": "%s", "firmware": "%s" }
+       "env": { "model": "%s", "serial": "%s", "hardware": "%s", "firmware": "%s", "readings": %i, "errors": %i }
     }
 })";
 // end string
@@ -390,19 +432,21 @@ boolean mqttSendHardwareInfo() {
       longmac,
       __VERSION__, __DATE__, __TIME__,
       vemlPresent ? "veml7700" : maxPresent ? "max4400x" : "missing",  // stacked ternary.
-      aqPresent ? envProduct : "missing", aqPresent ? envSerial : "", aqPresent ? envHardware : "", aqPresent ? envFirmware : ""
+      aqPresent ? envProduct : "missing", aqPresent ? envSerial : "", aqPresent ? envHardware : "", aqPresent ? envFirmware : "",
+      aqReadings, aqErrors
     );
 
     sprintf(topic, "aq2mqtt/%s/hardware", mqttPrefix);
     
     Serial.print("Sending MQTT hardware configuration info ... ");    
+    Serial.print(msg);
 
     if (! mqttclient.publish(topic, msg, mqttRetain)) {
-      Serial.println("failed to send.");
+      Serial.println(" ... failed to send.");
       return 0;
     }
     else {
-      Serial.println("ok.");
+      Serial.println(" ... ok.");
       pleaseSendHardware = 0;
     }
 
@@ -492,12 +536,12 @@ boolean mqttSendState() {
 
 
   char vocstr[32] = "false";
-  if (timeNow > vocSettleTime && aqPresent) {
+  if (! isnan(vocIndex) && timeNow > vocSettleTime && aqPresent) {
     sprintf(vocstr, "\"%0.2f\"", vocIndex);
   }
   
   char noxstr[32] = "false";
-  if (timeNow > noxSettleTime && aqPresent) {
+  if (! isnan(noxIndex) && timeNow > noxSettleTime && aqPresent) {
     sprintf(noxstr, "\"%0.2f\"", noxIndex);
   }
   
@@ -559,18 +603,15 @@ boolean mqttSendState() {
     
     
 		Serial.print("Sending MQTT state ... ");
-
-    
-    //debug
-    //Serial.println(msg);
+    Serial.print(msg);
 
       
 	  if (! mqttclient.publish(topic, msg, mqttRetain)) {
-      Serial.println("failed to send.");
+      Serial.println(" ... failed to send.");
       return 0;
     }
     else {
-			Serial.println(" sent.");
+			Serial.println(" ... sent.");
       
       // save the "last SENT values" ... TODO this doesn't account for pre-settled updates where the values were not actually sent.
       lastLux = lux;
@@ -663,6 +704,9 @@ void pollsen() {
     uint16_t error;
     char errorMessage[256];
 
+    aqReadings++;
+
+    
     // for SEN55 all results are returned
     // for SEN54 that doesn't have Nox sensor, this will simply return NaN
     // for SEN50 the voc, nox, temp and humidity will all return NaN (not tested)
@@ -688,9 +732,21 @@ void pollsen() {
         vocIndex = NAN;
         noxIndex = NAN;
 
+        // if this fires, we log silently to Serial and then sent a set of false updates indefinitely.
+        // TODO - log error via mqtt; or install a syslog/similar to get the log of actual error message out
+        // of the system.
+
+        
         // disable -- TODO this is good for testing when I disconnect the cable.  need to update
         // this to handle a few real errors and just retry; then on too many either disable or reboot/reset.
-        aqPresent = 0;
+        //aqPresent = 0;
+        
+        aqErrors++;
+
+        // send text of message
+        mqttSendError(errorMessage);
+
+        // send hardware update to include aqError count
         pleaseSendHardware = 1;
         
     }
@@ -743,7 +799,7 @@ void setup() {
     veml.setGain(VEML7700_GAIN_1);
     veml.setIntegrationTime(VEML7700_IT_800MS);
 
-    Serial.println("Product: VEML7700");
+    Serial.println("  Product: VEML7700");
     //Serial.println("  Gain: 1  Integration Time: 800ms"); // literally what we just set them to.
     
   } // setup lux
@@ -753,7 +809,7 @@ void setup() {
   int err = maxLux.getError();
   if (err == 0) {
     Serial.println("Lux sensor found");
-    Serial.println("Product: MAX4400x");
+    Serial.println("  Product: MAX4400x");
     maxPresent = 1;
   }
   
